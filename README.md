@@ -5,6 +5,11 @@ Bitcoin Core integration/staging tree
 
 https://bitcoincore.org
 
+**Modifications:**
+
+* Extend `gettxoutsetinfo` with an option to include maps of blockheight->count/amount
+* Default `txindex` option to `true`
+
 What is Bitcoin?
 ----------------
 

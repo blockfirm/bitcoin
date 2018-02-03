@@ -48,6 +48,57 @@ static CUpdatedBlock latestblock;
 
 extern void TxToJSON(const CTransaction& tx, const uint256 hashBlock, UniValue& entry);
 
+static const std::string base64_chars =
+             "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+             "abcdefghijklmnopqrstuvwxyz"
+             "0123456789+/";
+
+std::string base64Encode(unsigned char const *bytes_to_encode, unsigned int in_len) {
+    std::string ret;
+    int i = 0;
+    int j = 0;
+    unsigned char char_array_3[3];
+    unsigned char char_array_4[4];
+
+    while (in_len--) {
+      char_array_3[i++] = *(bytes_to_encode++);
+
+      if (i == 3) {
+          char_array_4[0] = (char_array_3[0] & 0xfc) >> 2;
+          char_array_4[1] = ((char_array_3[0] & 0x03) << 4) + ((char_array_3[1] & 0xf0) >> 4);
+          char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) + ((char_array_3[2] & 0xc0) >> 6);
+          char_array_4[3] = char_array_3[2] & 0x3f;
+
+          for (i = 0; i < 4; ++i) {
+              ret += base64_chars[char_array_4[i]];
+          }
+
+          i = 0;
+      }
+    }
+
+    if (i) {
+        for (j = i; j < 3; ++j) {
+            char_array_3[j] = '\0';
+        }
+
+        char_array_4[0] = (char_array_3[0] & 0xfc) >> 2;
+        char_array_4[1] = ((char_array_3[0] & 0x03) << 4) + ((char_array_3[1] & 0xf0) >> 4);
+        char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) + ((char_array_3[2] & 0xc0) >> 6);
+        char_array_4[3] = char_array_3[2] & 0x3f;
+
+        for (j = 0; j < i + 1; ++j) {
+            ret += base64_chars[char_array_4[j]];
+        }
+
+        while (i++ < 3) {
+            ret += '=';
+        }
+    }
+
+    return ret;
+}
+
 /* Calculate the difficulty for a given block index,
  * or the block index of the given chain.
  */
@@ -815,10 +866,13 @@ struct CCoinsStats
     uint64_t nDiskSize;
     CAmount nTotalAmount;
 
+    std::map<uint32_t, uint64_t> mapBlockUtxoCount;
+    std::map<uint32_t, uint64_t> mapBlockUtxoAmount;
+
     CCoinsStats() : nHeight(0), nTransactions(0), nTransactionOutputs(0), nBogoSize(0), nDiskSize(0), nTotalAmount(0) {}
 };
 
-static void ApplyStats(CCoinsStats &stats, CHashWriter& ss, const uint256& hash, const std::map<uint32_t, Coin>& outputs)
+static void ApplyStats(CCoinsStats &stats, CHashWriter& ss, const uint256& hash, const std::map<uint32_t, Coin>& outputs, bool fBlockmap)
 {
     assert(!outputs.empty());
     ss << hash;
@@ -832,12 +886,26 @@ static void ApplyStats(CCoinsStats &stats, CHashWriter& ss, const uint256& hash,
         stats.nTotalAmount += output.second.out.nValue;
         stats.nBogoSize += 32 /* txid */ + 4 /* vout index */ + 4 /* height + coinbase */ + 8 /* amount */ +
                            2 /* scriptPubKey len */ + output.second.out.scriptPubKey.size() /* scriptPubKey */;
+                           
+        if (fBlockmap) {
+            if (stats.mapBlockUtxoCount.count(output.second.nHeight) > 0) {
+                ++stats.mapBlockUtxoCount[output.second.nHeight];
+            } else {
+                stats.mapBlockUtxoCount[output.second.nHeight] = 1;
+            }
+
+            if (stats.mapBlockUtxoAmount.count(output.second.nHeight) > 0) {
+                stats.mapBlockUtxoAmount[output.second.nHeight] += output.second.out.nValue;
+            } else {
+                stats.mapBlockUtxoAmount[output.second.nHeight] = output.second.out.nValue;
+            }
+        }
     }
     ss << VARINT(0);
 }
 
 //! Calculate statistics about the unspent transaction output set
-static bool GetUTXOStats(CCoinsView *view, CCoinsStats &stats)
+static bool GetUTXOStats(CCoinsView *view, CCoinsStats &stats, bool fBlockmap)
 {
     std::unique_ptr<CCoinsViewCursor> pcursor(view->Cursor());
     assert(pcursor);
@@ -857,7 +925,7 @@ static bool GetUTXOStats(CCoinsView *view, CCoinsStats &stats)
         Coin coin;
         if (pcursor->GetKey(key) && pcursor->GetValue(coin)) {
             if (!outputs.empty() && key.hash != prevkey) {
-                ApplyStats(stats, ss, prevkey, outputs);
+                ApplyStats(stats, ss, prevkey, outputs, fBlockmap);
                 outputs.clear();
             }
             prevkey = key.hash;
@@ -868,7 +936,7 @@ static bool GetUTXOStats(CCoinsView *view, CCoinsStats &stats)
         pcursor->Next();
     }
     if (!outputs.empty()) {
-        ApplyStats(stats, ss, prevkey, outputs);
+        ApplyStats(stats, ss, prevkey, outputs, fBlockmap);
     }
     stats.hashSerialized = ss.GetHash();
     stats.nDiskSize = view->EstimateSize();
@@ -924,13 +992,36 @@ UniValue pruneblockchain(const JSONRPCRequest& request)
     return uint64_t(height);
 }
 
+std::string serializeBlockMap(std::map<uint32_t, uint64_t> map, int denominator) {
+    int offset = 0;
+    int dataLen = map.size() * 8;
+    unsigned char *data = (unsigned char*) malloc(dataLen);
+
+    for (auto const &item : map) {
+        // Serialize the second value as 32 bit.
+        // Divide by denominator to make sure the value doesn't hit the maximum.
+        // This will instead make the value lose precision.
+        uint32_t int32Value = item.second / denominator;
+        memcpy(data+offset, &item.first, 4);
+        memcpy(data+offset+4, &int32Value, 4);
+        offset += 8;
+    }
+
+    std::string encoded = base64Encode(data, dataLen);
+    free(data);
+
+    return encoded;
+}
+
 UniValue gettxoutsetinfo(const JSONRPCRequest& request)
 {
-    if (request.fHelp || request.params.size() != 0)
+    if (request.fHelp || request.params.size() > 1)
         throw std::runtime_error(
             "gettxoutsetinfo\n"
             "\nReturns statistics about the unspent transaction output set.\n"
             "Note this call may take some time.\n"
+            "\nArguments:\n"
+            "1. \"blockmap\"             (boolean, optional, default=false) returns blockmaps if true\n"
             "\nResult:\n"
             "{\n"
             "  \"height\":n,     (numeric) The current block height (index)\n"
@@ -941,17 +1032,25 @@ UniValue gettxoutsetinfo(const JSONRPCRequest& request)
             "  \"hash_serialized_2\": \"hash\", (string) The serialized hash\n"
             "  \"disk_size\": n,         (numeric) The estimated size of the chainstate on disk\n"
             "  \"total_amount\": x.xxx          (numeric) The total amount\n"
+            "  \"map_utxo_count\": \"base64\",   (string) Map: blockheight -> number of unspent outputs\n"
+            "  \"map_utxo_amount\": \"base64\"   (string) Map: blockheight -> unspent amount\n"
             "}\n"
             "\nExamples:\n"
             + HelpExampleCli("gettxoutsetinfo", "")
             + HelpExampleRpc("gettxoutsetinfo", "")
         );
 
+    bool fBlockmap = false;
+
+    if (request.params.size() > 0) {
+        fBlockmap = request.params[0].get_bool();
+    }
+
     UniValue ret(UniValue::VOBJ);
 
     CCoinsStats stats;
     FlushStateToDisk();
-    if (GetUTXOStats(pcoinsdbview.get(), stats)) {
+    if (GetUTXOStats(pcoinsdbview.get(), stats, fBlockmap)) {
         ret.push_back(Pair("height", (int64_t)stats.nHeight));
         ret.push_back(Pair("bestblock", stats.hashBlock.GetHex()));
         ret.push_back(Pair("transactions", (int64_t)stats.nTransactions));
@@ -960,6 +1059,13 @@ UniValue gettxoutsetinfo(const JSONRPCRequest& request)
         ret.push_back(Pair("hash_serialized_2", stats.hashSerialized.GetHex()));
         ret.push_back(Pair("disk_size", stats.nDiskSize));
         ret.push_back(Pair("total_amount", ValueFromAmount(stats.nTotalAmount)));
+
+        if (fBlockmap) {
+            // The UTXO amount will be divided by 10,000.
+            // (divide the value again by 10,000 to get it in bitcoin)
+            ret.push_back(Pair("map_utxo_count", serializeBlockMap(stats.mapBlockUtxoCount, 1)));
+            ret.push_back(Pair("map_utxo_amount", serializeBlockMap(stats.mapBlockUtxoAmount, 10000)));
+        }
     } else {
         throw JSONRPCError(RPC_INTERNAL_ERROR, "Unable to read UTXO set");
     }
